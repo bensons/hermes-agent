@@ -1,6 +1,7 @@
 """A2A client tools (``a2a`` toolset): a2a_discover/call/list/history/orchestrate talk to *other*
 agents. Peers come from config.yaml ``a2a_agents: {name: {url, auth: {type: bearer, token}, timeout,
-capabilities}}``. Stdlib urllib; wire format is A2A v1.0 ``SendMessage`` (v0.3 replies still parse)."""
+capabilities, tls: {ca_file, cert_file, key_file, key_password}}}``. Stdlib urllib; wire format is
+A2A v1.0 ``SendMessage`` (v0.3 replies still parse)."""
 
 from __future__ import annotations
 
@@ -8,7 +9,9 @@ import contextlib
 import json
 import logging
 import os
+import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional
@@ -52,9 +55,46 @@ def _auth_header(auth: dict) -> dict:
     return {"Authorization": f"Bearer {auth['token']}"} if auth and auth.get("type") == "bearer" and auth.get("token") else {}
 
 
-def _http_json(url: str, headers: dict, timeout: int, method: str, data: Optional[bytes] = None) -> dict:
+# Per-peer TLS/mTLS — configured via a ``tls:`` block on the peer:
+#   tls: {ca_file: /path/ca.crt, cert_file: /path/client.pem,
+#         key_file: /path/client.key, key_password: "..."}
+# cert_file may be a combined PEM (cert+key); key_file/key_password are then optional.
+# Use for private-CA deployments and client-certificate (mTLS) peer authentication.
+def _ssl_context(tls: dict) -> Optional[ssl.SSLContext]:
+    if not tls:
+        return None
+    ctx = ssl.create_default_context(cafile=tls.get("ca_file") or None)
+    cert = tls.get("cert_file")
+    if cert:
+        ctx.load_cert_chain(certfile=cert, keyfile=tls.get("key_file") or None,
+                            password=tls.get("key_password") or None)
+    return ctx
+
+
+def _tls_for_url(url: str) -> dict:
+    """tls block of the configured peer sharing this URL's origin (scheme/host/port), else {}.
+
+    Origin (not exact) match so a card-advertised JSONRPC interface path on the
+    peer's own host still gets the peer's TLS settings."""
+    try:
+        want = urllib.parse.urlsplit(url)
+        for entry in _configured_peers().values():
+            if not isinstance(entry, dict):
+                continue
+            got = urllib.parse.urlsplit(str(entry.get("url", "")))
+            if (want.scheme, want.hostname, want.port) == (got.scheme, got.hostname, got.port):
+                return entry.get("tls", {}) or {}
+    except Exception:
+        pass
+    return {}
+
+
+def _http_json(url: str, headers: dict, timeout: int, method: str, data: Optional[bytes] = None,
+               context: Optional[ssl.SSLContext] = None) -> dict:
+    # context=None derives per-peer TLS from config; tests/mocks keep working untouched.
+    ctx = context if context is not None else _ssl_context(_tls_for_url(url))
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:  # noqa: S310 (configured peers)
         return json.loads(resp.read().decode("utf-8"))
 
 

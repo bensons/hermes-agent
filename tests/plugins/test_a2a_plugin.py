@@ -15,6 +15,7 @@ import hmac
 import json
 import os
 import socket
+import ssl
 import threading
 import urllib.error
 import urllib.request
@@ -1727,3 +1728,28 @@ class TestMultiplexConstructionScope:
         assert adapter.port == 9111
         assert adapter.agent_name == "default-profile-agent"
         assert adapter._agents[""]["description"] == "Default profile's own agent."
+
+
+# --------------------------------------------------------------------------
+# Per-peer TLS/mTLS
+# --------------------------------------------------------------------------
+
+class TestPeerTls:
+    def test_no_tls_block_returns_none(self):
+        assert tools._ssl_context({}) is None
+
+    def test_ca_only_builds_verifying_context(self):
+        ctx = tools._ssl_context({"ca_file": ""})
+        assert isinstance(ctx, ssl.SSLContext)
+        assert ctx.verify_mode == ssl.CERT_REQUIRED
+        assert ctx.check_hostname is True
+
+    def test_tls_for_url_matches_peer_origin(self, monkeypatch):
+        monkeypatch.setattr(tools, "_configured_peers", lambda: {
+            "internal": {"url": "https://agent.internal:2090", "tls": {"ca_file": "/ca.crt"}}})
+        assert tools._tls_for_url("https://agent.internal:2090") == {"ca_file": "/ca.crt"}
+        # card-advertised JSONRPC interface path on the same origin still matches
+        assert tools._tls_for_url("https://agent.internal:2090/a2a/rpc") == {"ca_file": "/ca.crt"}
+        assert tools._tls_for_url("https://agent.internal:9999") == {}  # different port
+        assert tools._tls_for_url("http://agent.internal:2090") == {}   # different scheme
+        assert tools._tls_for_url("https://elsewhere:2090") == {}       # different host

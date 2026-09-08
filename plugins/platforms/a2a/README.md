@@ -27,6 +27,14 @@ a2a_agents:
     auth: { type: bearer, token: "sk-..." }
     timeout: 120
     capabilities: [web_search, research]
+  internal:
+    url: "https://agent.internal.example:2090"
+    # optional per-peer TLS: private CA and/or client-certificate (mTLS) auth
+    tls:
+      ca_file: "/path/to/ca.crt"        # private CA bundle
+      cert_file: "/path/to/client.pem"  # client cert (may include key)
+      # key_file: "/path/to/client.key" # only if not combined into cert_file
+      # key_password: "..."             # only if the key is encrypted
 ```
 
 ## Outbound — call other agents
