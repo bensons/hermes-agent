@@ -37,6 +37,16 @@ a2a_agents:
       # key_password: "..."             # only if the key is encrypted
 ```
 
+TLS settings belong to the selected peer and apply to both discovery and RPC,
+including legacy card discovery and same-origin redirects. For TLS-configured
+peers, cross-origin redirects and card-advertised RPC URLs are rejected; configure
+the destination as a separate peer to call it. Explicit and implicit default ports
+(such as HTTPS port 443) count as the same origin.
+
+URL-only discovery and calls prefer a matching configured peer URL, then an
+unambiguous origin match. If peers sharing an origin have different TLS settings
+and the URL cannot distinguish them, call the peer by its configured name.
+
 ## Outbound — call other agents
 
 The agent gets five tools:

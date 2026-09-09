@@ -439,7 +439,7 @@ class TestClientTools:
             description="finds things",
             skills=[{"id": "s", "name": "search", "description": "web search"}],
         )
-        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: card)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t, context=None: card)
         out = tools.a2a_discover({"url": "http://localhost:9999"})
         assert "researcher" in out
         assert "search" in out
@@ -449,11 +449,11 @@ class TestClientTools:
         """Outbound params: contextId inside the message, v1.0 role, no kind."""
         monkeypatch.setattr(tools, "_load_config",
                             lambda: {"a2a_agents": {"r": {"url": "http://localhost:9999"}}})
-        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t, context=None: None)
 
         captured = {}
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, context=None):
             captured["body"] = body
             ctx = body["params"]["message"].get("contextId", "c1")
             return protocol.jsonrpc_result(
@@ -479,9 +479,9 @@ class TestClientTools:
     def test_call_reports_input_required(self, monkeypatch):
         monkeypatch.setattr(tools, "_load_config",
                             lambda: {"a2a_agents": {"r": {"url": "http://localhost:9999"}}})
-        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t, context=None: None)
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, context=None):
             return protocol.jsonrpc_result(
                 body["id"],
                 protocol.build_task("t", "ctx-q", protocol.STATE_INPUT_REQUIRED, "Which repo?"),
@@ -544,10 +544,10 @@ class TestRegistryDispatchConvention:
         alias for 'agent' so the call doesn't fail the required-arg guard."""
         monkeypatch.setattr(tools, "_load_config",
                             lambda: {"a2a_agents": {"peer": {"url": "http://localhost:9999"}}})
-        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t, context=None: None)
         captured = {}
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, context=None):
             captured["sent"] = True
             return protocol.jsonrpc_result(
                 body["id"],
@@ -1399,7 +1399,7 @@ class TestClientTenantAndDiscovery:
     def test_rpc_body_echoes_tenant_from_agent_card(self, monkeypatch):
         posted = {}
 
-        def fake_get(url, headers, timeout):
+        def fake_get(url, headers, timeout, context=None):
             assert url.endswith("/.well-known/agent-card.json")
             return protocol.build_agent_card(
                 name="dev",
@@ -1408,7 +1408,7 @@ class TestClientTenantAndDiscovery:
                 tenant="dev-team",
             )
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, context=None):
             posted["url"] = url
             posted["body"] = body
             return {"jsonrpc": "2.0", "id": body["id"], "result": protocol.build_task(
@@ -1427,7 +1427,7 @@ class TestClientTenantAndDiscovery:
     def test_discovery_falls_back_to_legacy_agent_json(self, monkeypatch):
         calls = []
 
-        def fake_get(url, headers, timeout):
+        def fake_get(url, headers, timeout, context=None):
             calls.append(url)
             if url.endswith("agent-card.json"):
                 raise urllib.error.HTTPError(url, 404, "not found", {}, None)
@@ -1477,11 +1477,11 @@ class TestV1SpecRegressionFixes:
     def test_client_sends_v1_method_and_unwraps_response(self, monkeypatch):
         posted = {}
 
-        def fake_get(url, headers, timeout):
+        def fake_get(url, headers, timeout, context=None):
             return protocol.build_agent_card(
                 name="dev", url="http://peer.example/dev/", description="dev", tenant="dev-team")
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, context=None):
             posted["headers"] = headers
             posted["body"] = body
             return {"jsonrpc": "2.0", "id": body["id"], "result": {"task": protocol.build_task(
@@ -1744,12 +1744,17 @@ class TestPeerTls:
         assert ctx.verify_mode == ssl.CERT_REQUIRED
         assert ctx.check_hostname is True
 
-    def test_tls_for_url_matches_peer_origin(self, monkeypatch):
+    @pytest.mark.parametrize("configured, requested", [
+        ("https://agent.internal", "https://agent.internal:443/a2a/rpc"),
+        ("https://agent.internal:443", "https://agent.internal/a2a/rpc"),
+        ("https://agent.internal:2090", "https://agent.internal:2090/a2a/rpc"),
+    ])
+    def test_tls_for_url_matches_peer_origin(self, monkeypatch, configured, requested):
         monkeypatch.setattr(tools, "_configured_peers", lambda: {
-            "internal": {"url": "https://agent.internal:2090", "tls": {"ca_file": "/ca.crt"}}})
-        assert tools._tls_for_url("https://agent.internal:2090") == {"ca_file": "/ca.crt"}
+            "internal": {"url": configured, "tls": {"ca_file": "/ca.crt"}}})
+        assert tools._tls_for_url(configured) == {"ca_file": "/ca.crt"}
         # card-advertised JSONRPC interface path on the same origin still matches
-        assert tools._tls_for_url("https://agent.internal:2090/a2a/rpc") == {"ca_file": "/ca.crt"}
+        assert tools._tls_for_url(requested) == {"ca_file": "/ca.crt"}
         assert tools._tls_for_url("https://agent.internal:9999") == {}  # different port
         assert tools._tls_for_url("http://agent.internal:2090") == {}   # different scheme
         assert tools._tls_for_url("https://elsewhere:2090") == {}       # different host

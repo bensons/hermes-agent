@@ -40,13 +40,15 @@ def _configured_peers() -> dict:
 
 def _peer_from_entry(entry: dict, **extra: Any) -> dict:
     return {"url": entry.get("url", ""), "auth": entry.get("auth", {}) or {},
-            "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)), **extra}
+            "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)),
+            "tls": entry.get("tls", {}) or {}, **extra}
 
 
 def _resolve_peer(agent: str) -> Optional[dict]:
-    """Peer name -> {url, auth, timeout, capabilities, tenant}, or treat ``agent`` as a URL."""
+    """Resolve a peer's connection settings, or treat ``agent`` as a URL."""
     if agent.startswith(("http://", "https://")):
-        return {"url": agent, "auth": {}, "timeout": _DEFAULT_TIMEOUT, "capabilities": []}
+        return {"url": agent, "auth": {}, "timeout": _DEFAULT_TIMEOUT,
+                "capabilities": [], "tls": _tls_for_url(agent)}
     entry = _configured_peers().get(agent)
     return _peer_from_entry(entry, capabilities=entry.get("capabilities", []) or [], tenant=entry.get("tenant", "")) if entry else None
 
@@ -71,51 +73,78 @@ def _ssl_context(tls: dict) -> Optional[ssl.SSLContext]:
     return ctx
 
 
-def _tls_for_url(url: str) -> dict:
-    """tls block of the configured peer sharing this URL's origin (scheme/host/port), else {}.
+def _origin(url: str) -> tuple[str, Optional[str], Optional[int]]:
+    parsed = urllib.parse.urlsplit(url)
+    port = parsed.port if parsed.port is not None else {"https": 443, "http": 80}.get(parsed.scheme)
+    return parsed.scheme, parsed.hostname, port
 
-    Origin (not exact) match so a card-advertised JSONRPC interface path on the
-    peer's own host still gets the peer's TLS settings."""
-    try:
-        want = urllib.parse.urlsplit(url)
-        for entry in _configured_peers().values():
-            if not isinstance(entry, dict):
-                continue
-            got = urllib.parse.urlsplit(str(entry.get("url", "")))
-            if (want.scheme, want.hostname, want.port) == (got.scheme, got.hostname, got.port):
-                return entry.get("tls", {}) or {}
-    except Exception:
-        pass
-    return {}
+
+def _tls_for_url(url: str) -> dict:
+    """Resolve URL-only calls without guessing between peer identities on one origin."""
+    matches, exact = [], []
+    want = urllib.parse.urlsplit(url)
+    origin = _origin(url)
+    for entry in _configured_peers().values():
+        if not isinstance(entry, dict):
+            continue
+        peer_url = str(entry.get("url", ""))
+        if origin != _origin(peer_url):
+            continue
+        matches.append(entry)
+        got = urllib.parse.urlsplit(peer_url)
+        if (want.path.rstrip("/"), want.query) == (got.path.rstrip("/"), got.query):
+            exact.append(entry)
+    candidates = exact or matches
+    if not candidates:
+        return {}
+    tls = candidates[0].get("tls", {}) or {}
+    if any((entry.get("tls", {}) or {}) != tls for entry in candidates[1:]):
+        raise ValueError("Error: ambiguous TLS configuration for URL; call a configured peer by name.")
+    return tls
+
+
+class _PeerRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if _origin(req.full_url) != _origin(newurl):
+            raise urllib.error.HTTPError(
+                req.full_url, code, "Cross-origin redirect blocked for TLS-configured peer", headers, fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def _http_json(url: str, headers: dict, timeout: int, method: str, data: Optional[bytes] = None,
                context: Optional[ssl.SSLContext] = None) -> dict:
-    # context=None derives per-peer TLS from config; tests/mocks keep working untouched.
-    ctx = context if context is not None else _ssl_context(_tls_for_url(url))
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:  # noqa: S310 (configured peers)
+    if context is not None:
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=context), _PeerRedirectHandler(),
+        )
+        response = opener.open(req, timeout=timeout)
+    else:
+        response = urllib.request.urlopen(req, timeout=timeout)  # noqa: S310 (configured peers)
+    with response as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _http_get_json(url: str, headers: dict, timeout: int) -> dict:
-    return _http_json(url, headers, timeout, "GET")
+def _http_get_json(url: str, headers: dict, timeout: int, context: Optional[ssl.SSLContext] = None) -> dict:
+    return _http_json(url, headers, timeout, "GET", context=context)
 
 
-def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
+def _http_post_json(url: str, body: dict, headers: dict, timeout: int,
+                    context: Optional[ssl.SSLContext] = None) -> dict:
     hdrs = {"Content-Type": "application/json", "A2A-Version": protocol.PROTOCOL_VERSION, **headers}
-    return _http_json(url, hdrs, timeout, "POST", json.dumps(body).encode("utf-8"))
+    return _http_json(url, hdrs, timeout, "POST", json.dumps(body).encode("utf-8"), context=context)
 
 
-def _fetch_card(base_url: str, headers: dict, timeout: int) -> dict:
+def _fetch_card(base_url: str, headers: dict, timeout: int, context: Optional[ssl.SSLContext] = None) -> dict:
     """GET the v1.0 agent-card.json; on 404 fall back to the v0.2 agent.json alias."""
     base = base_url.rstrip("/")
     try:
-        return _http_get_json(base + "/.well-known/agent-card.json", headers, timeout)
+        return _http_get_json(base + "/.well-known/agent-card.json", headers, timeout, context=context)
     except urllib.error.HTTPError as e:
         if e.code != 404:
             raise
-    return _http_get_json(base + "/.well-known/agent.json", headers, timeout)
+    return _http_get_json(base + "/.well-known/agent.json", headers, timeout, context=context)
 
 
 def _select_jsonrpc_interface(card: Optional[dict]) -> Optional[dict]:
@@ -141,10 +170,14 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     base_url = peer.get("url", "")
     headers = _auth_header(peer.get("auth", {}) or {})
     timeout = int(peer.get("timeout", _DEFAULT_TIMEOUT))
+    tls_context = _ssl_context(peer.get("tls", {}) or {})
     try:
-        card = _fetch_card(base_url, headers, min(timeout, 30))  # best-effort, to learn the rpc URL
+        card = _fetch_card(base_url, headers, min(timeout, 30), context=tls_context)
     except Exception:
         card = None
+    rpc_url = _rpc_url(base_url, card)
+    if tls_context is not None and _origin(rpc_url) != _origin(base_url):
+        raise ValueError("Error: cross-origin RPC interface blocked for TLS-configured peer.")
     ctx = context_id or protocol.new_context_id()
     safe_message = security.redact_outbound(message)
     # v1.0: contextId lives inside the Message, not at the params top level.
@@ -157,7 +190,7 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     security.audit("outbound", agent_label, rpc_body["id"], safe_message)
     protocol.persist_message(ctx, "user", safe_message, rpc_body["id"])
     protocol.metrics.outbound_total += 1
-    resp = _http_post_json(_rpc_url(base_url, card), rpc_body, headers, timeout)
+    resp = _http_post_json(rpc_url, rpc_body, headers, timeout, context=tls_context)
     if "error" in resp:
         raise ValueError(f"Peer '{agent_label}' returned an error: {resp['error'].get('message', resp['error'])}")
     payload = protocol.unwrap_send_message_response(resp.get("result", {}))
@@ -192,7 +225,7 @@ def a2a_discover(args: dict, **_: Any) -> str:
     if not url:
         return "Error: 'url' is required (e.g. http://localhost:9999)."
     try:
-        card = _fetch_card(url, {}, _DEFAULT_TIMEOUT)
+        card = _fetch_card(url, {}, _DEFAULT_TIMEOUT, context=_ssl_context(_tls_for_url(url)))
     except urllib.error.HTTPError as e:
         return f"Error: discovery failed — HTTP {e.code} from {url}."
     except Exception as e:
@@ -220,7 +253,10 @@ def a2a_call(args: dict, **_: Any) -> str:
     context_id = str(args.get("context_id") or args.get("contextId") or "").strip()
     if not agent or not message:
         return "Error: both 'agent' and 'message' are required."
-    peer = _resolve_peer(agent)
+    try:
+        peer = _resolve_peer(agent)
+    except ValueError as e:
+        return str(e)
     if not peer or not peer.get("url"):
         return f"Error: unknown agent '{agent}'. Configure it under 'a2a_agents' in config.yaml or pass a full http(s):// URL."
     try:
