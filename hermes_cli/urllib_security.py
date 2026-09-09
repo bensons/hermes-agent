@@ -7,6 +7,7 @@ import logging
 import os
 import ssl
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable
@@ -40,13 +41,23 @@ def _strip_headers(request, keep: frozenset[str]) -> None:
 
 
 class SafeCredentialRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Preserve request headers only while redirects stay on one origin."""
+    """Preserve request headers only while redirects stay on one origin.
+
+    ``allow_cross_origin=False`` refuses a cross-origin redirect (``HTTPError`` carrying the
+    redirect's status) instead of following it stripped: a credential bound to the connection
+    itself — a TLS client certificate — cannot be removed from the follow-up request.
+    """
 
     def __init__(
-        self, original_url: str, *, cross_origin_safe_headers: Iterable[str] = _CROSS_ORIGIN_SAFE_HEADERS
+        self,
+        original_url: str,
+        *,
+        cross_origin_safe_headers: Iterable[str] = _CROSS_ORIGIN_SAFE_HEADERS,
+        allow_cross_origin: bool = True,
     ) -> None:
         self._original_origin = url_origin(original_url)
         self._cross_origin_safe_headers = frozenset(str(name).lower() for name in cross_origin_safe_headers)
+        self._allow_cross_origin = allow_cross_origin
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         # Let urllib enforce status/method semantics first (notably 307/308).
@@ -56,7 +67,14 @@ class SafeCredentialRedirectHandler(urllib.request.HTTPRedirectHandler):
 
         # Allowlist rather than guessing credential header names: normalize_extra_headers
         # permits arbitrary secret-bearing names.
-        if url_origin(urllib.parse.urljoin(req.full_url, newurl)) != self._original_origin:
+        target = url_origin(urllib.parse.urljoin(req.full_url, newurl))
+        if target != self._original_origin:
+            if not self._allow_cross_origin:
+                scheme, host, port = target
+                where = f"{scheme}://{host}" + (f":{port}" if port is not None else "")
+                raise urllib.error.HTTPError(
+                    req.full_url, code, f"cross-origin redirect to {where} refused", headers, fp
+                )
             _strip_headers(redirected, self._cross_origin_safe_headers)
         return redirected
 
@@ -111,12 +129,13 @@ def _resolved_https_context() -> ssl.SSLContext | None:
         return None
 
 
-def _secure_opener_from_installed_policy(original_url: str, *, ssl_context=None):
+def _secure_opener_from_installed_policy(original_url: str, *, ssl_context=None, allow_cross_origin_redirects=True):
     """Clone the installed opener's handlers, replacing redirect policy only.
 
     ``ssl_context`` rebinds the cloned HTTPS handler so per-provider TLS settings
     (``ssl_ca_cert``/``ssl_verify``) apply; with None a Hermes-owned opener gets the explicit CA
     default from ``_resolved_https_context`` and an application-installed opener keeps its TLS.
+    ``allow_cross_origin_redirects=False`` refuses redirects off the original origin outright.
     """
     installed = getattr(urllib.request, "_opener", None)
     if installed is None:
@@ -133,7 +152,7 @@ def _secure_opener_from_installed_policy(original_url: str, *, ssl_context=None)
     ]
     if replace_https:
         handlers.append(_https_handler_cls(context=ssl_context))
-    handlers.append(SafeCredentialRedirectHandler(original_url))
+    handlers.append(SafeCredentialRedirectHandler(original_url, allow_cross_origin=allow_cross_origin_redirects))
     handlers.append(_CrossOriginRequestSanitizer(original_url))
     secured = urllib.request.build_opener(*handlers)
     # OpenerDirector injects addheaders after request processors (bypassing the
@@ -149,20 +168,28 @@ def open_credentialed_url(
     timeout: float,
     opener_factory: Callable[..., Any] | None = None,
     ssl_context=None,
+    allow_cross_origin_redirects: bool = True,
 ):
     """Open a request without forwarding credentials across origins.
 
     Preserves an application-installed opener's proxy/TLS/cookies/handlers while replacing its
     redirect handler. ``opener_factory`` is an explicit test seam (security is never disabled
     based on global ``urlopen`` identity); ``ssl_context`` overrides TLS for this request only.
+    ``allow_cross_origin_redirects=False`` refuses a redirect off the request's origin instead of
+    following it without credentials — for a credential bound to the connection itself, such as a
+    TLS client certificate, which cannot be stripped from the follow-up request.
     """
     if opener_factory is None:
-        opener = _secure_opener_from_installed_policy(request.full_url, ssl_context=ssl_context)
+        opener = _secure_opener_from_installed_policy(
+            request.full_url, ssl_context=ssl_context, allow_cross_origin_redirects=allow_cross_origin_redirects
+        )
         for name, value in getattr(opener, "_hermes_initial_addheaders", ()):
             if not request.has_header(name):
                 request.add_header(name, value)
     else:
-        opener = opener_factory(SafeCredentialRedirectHandler(request.full_url))
+        opener = opener_factory(
+            SafeCredentialRedirectHandler(request.full_url, allow_cross_origin=allow_cross_origin_redirects)
+        )
     return opener.open(request, timeout=timeout)
 
 

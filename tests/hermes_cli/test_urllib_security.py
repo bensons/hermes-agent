@@ -140,6 +140,39 @@ def test_same_host_different_port_drops_credentials_on_wire():
     assert "cf-access-client-secret" not in headers
 
 
+def test_refused_cross_origin_redirect_never_reaches_the_other_origin():
+    """allow_cross_origin_redirects=False: a redirect off the origin fails closed (nothing is sent
+    to the other origin), while a same-origin redirect is still followed with credentials intact."""
+    source = _server()
+    sink = _server()
+    _RecordingHandler.requests = []
+    _RecordingHandler.redirect_status = 302
+    _RecordingHandler.redirect_to = f"http://localhost:{sink.server_port}/sink"
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{source.server_port}/redirect", headers=_credential_headers()
+        )
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            open_credentialed_url(request, timeout=3, allow_cross_origin_redirects=False)
+        assert refused.value.code == 302
+        assert "cross-origin redirect" in str(refused.value.reason)
+        assert _RecordingHandler.requests == []
+
+        _RecordingHandler.redirect_to = f"http://127.0.0.1:{source.server_port}/same-origin"
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{source.server_port}/redirect", headers=_credential_headers()
+        )
+        with open_credentialed_url(request, timeout=3, allow_cross_origin_redirects=False) as response:
+            response.read()
+    finally:
+        source.shutdown()
+        sink.shutdown()
+
+    [(method, headers)] = _RecordingHandler.requests
+    assert method == "GET"
+    assert headers["authorization"] == "Bearer secret"
+
+
 def test_post_307_remains_rejected_by_urllib():
     request = urllib.request.Request(
         "https://models.example.test/load",
