@@ -74,8 +74,9 @@ def _ssl_context(tls: Any) -> Optional[ssl.SSLContext]:
     try:
         ctx = ssl.create_default_context(cafile=paths.get("ca_file"))
         if "cert_file" in paths:
+            # None invokes OpenSSL's interactive password prompt, which can block a gateway worker.
             ctx.load_cert_chain(certfile=paths["cert_file"], keyfile=paths.get("key_file"),
-                                password=tls.get("key_password") or None)
+                                password=tls.get("key_password") or "")
     except (OSError, ssl.SSLError) as e:
         raise ValueError(f"Error: invalid TLS configuration — {e}") from e
     return ctx
@@ -112,6 +113,8 @@ def _tls_for_url(url: str) -> dict:
 
 def _http_json(url: str, headers: dict, timeout: int, method: str, data: Optional[bytes] = None,
                context: Optional[ssl.SSLContext] = None) -> dict:
+    if context is not None and urllib.parse.urlsplit(url).scheme.lower() != "https":
+        raise ValueError("Error: TLS configuration requires an https:// URL.")
     # A client certificate is bound to the connection, so a TLS-configured peer's redirects must stay on
     # its origin; other peers follow redirects with credential headers stripped (Hermes-wide policy).
     req = urllib.request.Request(url, data=data, headers=headers, method=method)

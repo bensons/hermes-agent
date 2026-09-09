@@ -73,6 +73,8 @@ Then just ask: *"Ask the researcher agent to summarize today's arXiv postings."*
 
 A peer's `tls` block applies to discovery and RPC alike. Because a client certificate authenticates the connection itself, a TLS-configured peer never follows a redirect — or a card-advertised RPC URL — to another origin; configure that destination as its own peer instead. Peers without `tls` follow redirects, but the bearer token is dropped once a redirect leaves the peer's origin.
 
+TLS-configured peers require an `https://` URL. Encrypted client keys require `key_password` (use an environment reference as above); missing or incorrect passwords produce a configuration error without an interactive prompt.
+
 ## Inbound: being callable
 
 With the platform enabled, Hermes serves:

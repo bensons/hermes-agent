@@ -34,7 +34,7 @@ a2a_agents:
       ca_file: "/path/to/ca.crt"        # private CA bundle
       cert_file: "/path/to/client.pem"  # client cert (may include key)
       # key_file: "/path/to/client.key" # only if not combined into cert_file
-      # key_password: "..."             # only if the key is encrypted
+      # key_password: "${A2A_CLIENT_KEY_PASSWORD}" # required for an encrypted key
 ```
 
 TLS settings belong to the selected peer and apply to both discovery and RPC,
@@ -42,7 +42,9 @@ including legacy card discovery and same-origin redirects. Paths may start with
 `~`, and `key_password` may reference an environment variable as `${VAR}`; without
 `ca_file` the system trust store is used. For TLS-configured peers, cross-origin
 redirects and card-advertised RPC URLs are refused; configure the destination as a
-separate peer to call it. Other peers follow redirects, but the bearer token (like
+separate peer to call it. TLS-configured peers require an `https://` URL; HTTP is
+rejected before sending any request. Encrypted keys require `key_password` and
+never prompt interactively. Other peers follow redirects, but the bearer token (like
 any credential header) is dropped once a redirect leaves the peer's origin. Explicit
 and implicit default ports (such as HTTPS port 443) count as the same origin.
 

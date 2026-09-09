@@ -6,6 +6,7 @@ import os
 import shutil
 import ssl
 import subprocess
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -200,3 +201,47 @@ def test_plain_peer_credentials_do_not_cross_origins(monkeypatch):
     assert body == {"served_by": int(destination.rsplit(":", 1)[1])}
     assert source_requests == [("/card", "Bearer secret")]
     assert destination_requests == [("/card", None)]
+
+
+@pytest.mark.parametrize("operation", ["call", "url", "discover", "orchestrate"])
+def test_tls_configuration_never_sends_plaintext(certificates, tmp_path, operation):
+    with _plain_server() as (url, received):
+        (tmp_path / "config.yaml").write_text(json.dumps({"a2a_agents": {
+            "peer": {"url": url, "tls": certificates["alice"], "capabilities": ["audit"]},
+        }}))
+        if operation == "discover":
+            result = tools.a2a_discover({"url": url})
+        elif operation == "orchestrate":
+            result = tools.a2a_orchestrate({"capability": "audit", "message": "hello"})
+        else:
+            result = tools.a2a_call({"agent": url if operation == "url" else "peer", "message": "hello"})
+        assert "TLS configuration requires an https:// URL" in result
+        assert received == []
+
+
+def test_encrypted_key_never_prompts_and_accepts_environment_password(certificates, tmp_path, monkeypatch):
+    encrypted_key = tmp_path / "encrypted.key"
+    subprocess.run([
+        "openssl", "pkey", "-in", certificates["alice"]["key_file"],
+        "-aes-256-cbc", "-passout", "pass:test-password", "-out", str(encrypted_key),
+    ], check=True, capture_output=True)
+    tls = {**certificates["alice"], "key_file": str(encrypted_key)}
+    (tmp_path / "config.yaml").write_text(json.dumps({"a2a_agents": {
+        "peer": {"url": "https://localhost", "tls": tls},
+    }}))
+    result = subprocess.run([
+        sys.executable, "-c",
+        "from plugins.platforms.a2a import tools; "
+        "print(tools.a2a_call({'agent': 'peer', 'message': 'hello'}))",
+    ], input="", text=True, capture_output=True, timeout=15)
+    assert result.returncode == 0
+    assert "invalid TLS configuration" in result.stdout
+    assert "Enter PEM pass phrase" not in result.stderr
+
+    monkeypatch.setenv("A2A_CLIENT_KEY_PASSWORD", "test-password")
+    with _server(certificates) as (url, received):
+        (tmp_path / "config.yaml").write_text(json.dumps({"a2a_agents": {
+            "peer": {"url": url, "tls": {**tls, "key_password": "${A2A_CLIENT_KEY_PASSWORD}"}},
+        }}))
+        assert "authenticated as alice" in tools.a2a_call({"agent": "peer", "message": "hello"})
+        assert received and all(name == "alice" for _, _, name in received)
