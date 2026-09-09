@@ -1,7 +1,8 @@
-"""Exercise outbound peer identity and origin boundaries over real TLS."""
+"""Exercise outbound peer identity and origin boundaries against real servers (TLS and plain)."""
 
 import contextlib
 import json
+import os
 import shutil
 import ssl
 import subprocess
@@ -148,3 +149,54 @@ def test_url_ambiguity_requires_named_peer(tmp_path, monkeypatch):
     assert "ambiguous TLS" in tools.a2a_discover({"url": url})
     for name, peer in peers.items():
         assert tools._resolve_peer(name)["tls"] == peer["tls"]
+
+
+def test_tls_paths_expand_home(certificates, tmp_path, monkeypatch):
+    """``~`` in tls paths resolves against the home directory, as elsewhere in config.yaml."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    tls = {key: "~/" + os.path.basename(path) for key, path in certificates["alice"].items()}
+    assert isinstance(tools._ssl_context(tls), ssl.SSLContext)
+
+
+@contextlib.contextmanager
+def _plain_server(*, redirect=None):
+    """http:// peer recording (path, Authorization); redirects every GET to ``redirect`` when set."""
+    received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            received.append((self.path, self.headers.get("Authorization")))
+            if redirect:
+                self.send_response(302)
+                self.send_header("Location", redirect)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps({"served_by": self.server.server_port}).encode())
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", received
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_plain_peer_credentials_do_not_cross_origins(monkeypatch):
+    """Peers without a tls block still follow redirects, but the bearer token never leaves the origin
+    it was configured for — the same policy as every other Hermes urllib caller."""
+    monkeypatch.setenv("NO_PROXY", "*")
+    with _plain_server() as (destination, destination_requests):
+        with _plain_server(redirect=f"{destination}/card") as (source, source_requests):
+            body = tools._http_get_json(f"{source}/card", {"Authorization": "Bearer secret"}, 5)
+    assert body == {"served_by": int(destination.rsplit(":", 1)[1])}
+    assert source_requests == [("/card", "Bearer secret")]
+    assert destination_requests == [("/card", None)]

@@ -38,10 +38,13 @@ a2a_agents:
 ```
 
 TLS settings belong to the selected peer and apply to both discovery and RPC,
-including legacy card discovery and same-origin redirects. For TLS-configured
-peers, cross-origin redirects and card-advertised RPC URLs are rejected; configure
-the destination as a separate peer to call it. Explicit and implicit default ports
-(such as HTTPS port 443) count as the same origin.
+including legacy card discovery and same-origin redirects. Paths may start with
+`~`, and `key_password` may reference an environment variable as `${VAR}`; without
+`ca_file` the system trust store is used. For TLS-configured peers, cross-origin
+redirects and card-advertised RPC URLs are refused; configure the destination as a
+separate peer to call it. Other peers follow redirects, but the bearer token (like
+any credential header) is dropped once a redirect leaves the peer's origin. Explicit
+and implicit default ports (such as HTTPS port 443) count as the same origin.
 
 URL-only discovery and calls prefer a matching configured peer URL, then an
 unambiguous origin match. If peers sharing an origin have different TLS settings

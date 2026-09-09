@@ -32,7 +32,10 @@ must not touch core files.** A2A now lives entirely under
   coarse heuristic; errors never win, and an all-error fan-out reports the
   failures instead of picking one).
 
-Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
+Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL. Outbound HTTP
+rides `hermes_cli.urllib_security.open_credentialed_url`; an optional per-peer
+`tls` block (private CA, client certificate) supplies the SSL context, and such a
+peer refuses cross-origin redirects and card-advertised RPC URLs off its origin.
 
 ### Inbound — platform adapter
 - Stdlib `http.server` on a daemon thread (no asyncio loop needed at

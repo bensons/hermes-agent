@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional
 
 from gateway.platforms._shared import coerce_port as _coerce_int
+from hermes_cli.urllib_security import open_credentialed_url, url_origin
 
 from . import protocol, security
 
@@ -62,67 +63,60 @@ def _auth_header(auth: dict) -> dict:
 #         key_file: /path/client.key, key_password: "..."}
 # cert_file may be a combined PEM (cert+key); key_file/key_password are then optional.
 # Use for private-CA deployments and client-certificate (mTLS) peer authentication.
-def _ssl_context(tls: dict) -> Optional[ssl.SSLContext]:
+def _ssl_context(tls: Any) -> Optional[ssl.SSLContext]:
+    """Context for a peer's ``tls`` block, or None so the request keeps Hermes' default TLS policy."""
     if not tls:
         return None
-    ctx = ssl.create_default_context(cafile=tls.get("ca_file") or None)
-    cert = tls.get("cert_file")
-    if cert:
-        ctx.load_cert_chain(certfile=cert, keyfile=tls.get("key_file") or None,
-                            password=tls.get("key_password") or None)
+    if not isinstance(tls, dict):
+        raise ValueError("Error: invalid TLS configuration — 'tls' must be a mapping "
+                         "(ca_file, cert_file, key_file, key_password).")
+    paths = {key: os.path.expanduser(str(tls[key])) for key in ("ca_file", "cert_file", "key_file") if tls.get(key)}
+    try:
+        ctx = ssl.create_default_context(cafile=paths.get("ca_file"))
+        if "cert_file" in paths:
+            ctx.load_cert_chain(certfile=paths["cert_file"], keyfile=paths.get("key_file"),
+                                password=tls.get("key_password") or None)
+    except (OSError, ssl.SSLError) as e:
+        raise ValueError(f"Error: invalid TLS configuration — {e}") from e
     return ctx
 
 
-def _origin(url: str) -> tuple[str, Optional[str], Optional[int]]:
-    parsed = urllib.parse.urlsplit(url)
-    port = parsed.port if parsed.port is not None else {"https": 443, "http": 80}.get(parsed.scheme)
-    return parsed.scheme, parsed.hostname, port
+def _same_origin(a: str, b: str) -> bool:
+    """Scheme, host and effective port all match; a malformed URL never shares an origin."""
+    try:
+        return url_origin(a) == url_origin(b)
+    except ValueError:
+        return False
 
 
 def _tls_for_url(url: str) -> dict:
-    """Resolve URL-only calls without guessing between peer identities on one origin."""
-    matches, exact = [], []
+    """``tls`` block for a URL-only call: the peer whose configured URL matches, else the peers on the
+    URL's origin — and only when those agree, so a shared origin never picks an identity by chance."""
     want = urllib.parse.urlsplit(url)
-    origin = _origin(url)
+    matches, exact = [], []
     for entry in _configured_peers().values():
-        if not isinstance(entry, dict):
-            continue
-        peer_url = str(entry.get("url", ""))
-        if origin != _origin(peer_url):
+        if not isinstance(entry, dict) or not _same_origin(url, str(entry.get("url", ""))):
             continue
         matches.append(entry)
-        got = urllib.parse.urlsplit(peer_url)
+        got = urllib.parse.urlsplit(str(entry.get("url", "")))
         if (want.path.rstrip("/"), want.query) == (got.path.rstrip("/"), got.query):
             exact.append(entry)
     candidates = exact or matches
     if not candidates:
         return {}
-    tls = candidates[0].get("tls", {}) or {}
-    if any((entry.get("tls", {}) or {}) != tls for entry in candidates[1:]):
+    tls = candidates[0].get("tls") or {}
+    if any((entry.get("tls") or {}) != tls for entry in candidates[1:]):
         raise ValueError("Error: ambiguous TLS configuration for URL; call a configured peer by name.")
     return tls
 
 
-class _PeerRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if _origin(req.full_url) != _origin(newurl):
-            raise urllib.error.HTTPError(
-                req.full_url, code, "Cross-origin redirect blocked for TLS-configured peer", headers, fp,
-            )
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
 def _http_json(url: str, headers: dict, timeout: int, method: str, data: Optional[bytes] = None,
                context: Optional[ssl.SSLContext] = None) -> dict:
+    # A client certificate is bound to the connection, so a TLS-configured peer's redirects must stay on
+    # its origin; other peers follow redirects with credential headers stripped (Hermes-wide policy).
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    if context is not None:
-        opener = urllib.request.build_opener(
-            urllib.request.HTTPSHandler(context=context), _PeerRedirectHandler(),
-        )
-        response = opener.open(req, timeout=timeout)
-    else:
-        response = urllib.request.urlopen(req, timeout=timeout)  # noqa: S310 (configured peers)
-    with response as resp:
+    with open_credentialed_url(req, timeout=timeout, ssl_context=context,
+                               allow_cross_origin_redirects=context is None) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -170,13 +164,13 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     base_url = peer.get("url", "")
     headers = _auth_header(peer.get("auth", {}) or {})
     timeout = int(peer.get("timeout", _DEFAULT_TIMEOUT))
-    tls_context = _ssl_context(peer.get("tls", {}) or {})
+    tls_context = _ssl_context(peer.get("tls") or {})
     try:
-        card = _fetch_card(base_url, headers, min(timeout, 30), context=tls_context)
+        card = _fetch_card(base_url, headers, min(timeout, 30), context=tls_context)  # best-effort, to learn the rpc URL
     except Exception:
         card = None
     rpc_url = _rpc_url(base_url, card)
-    if tls_context is not None and _origin(rpc_url) != _origin(base_url):
+    if tls_context is not None and not _same_origin(rpc_url, base_url):
         raise ValueError("Error: cross-origin RPC interface blocked for TLS-configured peer.")
     ctx = context_id or protocol.new_context_id()
     safe_message = security.redact_outbound(message)
@@ -219,15 +213,25 @@ def _reply_text_from_result(result: Any) -> str:
 _AUTH_ERR = "Error: peer '{agent}' rejected auth (HTTP {code}). Check the configured token."
 _HTTP_CALL_ERRORS = {401: _AUTH_ERR, 403: _AUTH_ERR, 429: "Error: peer '{agent}' rate limited us (HTTP 429). Retry later."}
 
+
+def _http_status(e: urllib.error.HTTPError) -> str:
+    """``HTTP <code>``, plus the reason for a 3xx — an unfollowed redirect is otherwise mute about why."""
+    return f"HTTP {e.code}" + (f" ({e.reason})" if 300 <= e.code < 400 else "")
+
+
 def a2a_discover(args: dict, **_: Any) -> str:
     """Fetch and summarize the Agent Card at ``url``."""
     url = str(args.get("url") or "").strip()
     if not url:
         return "Error: 'url' is required (e.g. http://localhost:9999)."
     try:
-        card = _fetch_card(url, {}, _DEFAULT_TIMEOUT, context=_ssl_context(_tls_for_url(url)))
+        context = _ssl_context(_tls_for_url(url))
+    except ValueError as e:
+        return str(e)
+    try:
+        card = _fetch_card(url, {}, _DEFAULT_TIMEOUT, context=context)
     except urllib.error.HTTPError as e:
-        return f"Error: discovery failed — HTTP {e.code} from {url}."
+        return f"Error: discovery failed — {_http_status(e)} from {url}."
     except Exception as e:
         return f"Error: could not reach {url} — {e}."
     caps = card.get("capabilities", {}) or {}
@@ -262,7 +266,8 @@ def a2a_call(args: dict, **_: Any) -> str:
     try:
         reply, reply_ctx, state = _send_task(agent, peer, message, context_id)
     except urllib.error.HTTPError as e:
-        return _HTTP_CALL_ERRORS.get(e.code, "Error: call to '{agent}' failed — HTTP {code}.").format(agent=agent, code=e.code)
+        return _HTTP_CALL_ERRORS.get(e.code, "Error: call to '{agent}' failed — {status}.").format(
+            agent=agent, code=e.code, status=_http_status(e))
     except ValueError as e:
         return str(e)
     except Exception as e:
@@ -327,7 +332,8 @@ def _call_peer_sync(agent_name: str, peer_entry: dict, message: str, context_id:
         reply, _ctx, _state = _send_task(agent_name, _peer_from_entry(peer_entry), message, context_id)
         return (agent_name, reply or "(no reply)")
     except Exception as e:
-        return (agent_name, f"Error: {e}")
+        detail = str(e)
+        return (agent_name, detail if detail.startswith("Error:") else f"Error: {detail}")
 
 
 def a2a_orchestrate(args: dict, **_: Any) -> str:

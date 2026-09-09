@@ -1758,3 +1758,18 @@ class TestPeerTls:
         assert tools._tls_for_url("https://agent.internal:9999") == {}  # different port
         assert tools._tls_for_url("http://agent.internal:2090") == {}   # different scheme
         assert tools._tls_for_url("https://elsewhere:2090") == {}       # different host
+
+    def test_tls_block_must_be_a_mapping(self):
+        with pytest.raises(ValueError, match="TLS configuration"):
+            tools._ssl_context(True)
+
+    def test_unreadable_tls_files_surface_as_config_errors(self, monkeypatch, tmp_path):
+        """A bad tls block is a configuration error, not a network failure — reported once, in both
+        the direct call and the orchestrate fan-out (no 'Error: Error:' double prefix)."""
+        peer = {"url": "https://agent.internal", "capabilities": ["audit"],
+                "tls": {"ca_file": str(tmp_path / "missing-ca.pem")}}
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {"internal": peer}})
+        for out in (tools.a2a_call({"agent": "internal", "message": "hi"}),
+                    tools.a2a_orchestrate({"capability": "audit", "message": "hi"})):
+            assert "invalid TLS configuration" in out
+            assert "Error: Error:" not in out

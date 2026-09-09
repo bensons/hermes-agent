@@ -60,9 +60,18 @@ a2a_agents:
     auth: { type: bearer, token: "..." }
     timeout: 120
     capabilities: [web_search, research]
+  internal:
+    url: "https://agent.internal.example:2090"
+    tls:                                       # optional: private CA and/or client certificate (mTLS)
+      ca_file: "~/certs/internal-ca.pem"
+      cert_file: "~/certs/hermes-client.pem"   # may include the key
+      # key_file: "~/certs/hermes-client.key"  # only if not combined into cert_file
+      # key_password: "${A2A_CLIENT_KEY_PASSWORD}"
 ```
 
 Then just ask: *"Ask the researcher agent to summarize today's arXiv postings."* Direct URLs work too — `a2a_call` accepts any A2A endpoint.
+
+A peer's `tls` block applies to discovery and RPC alike. Because a client certificate authenticates the connection itself, a TLS-configured peer never follows a redirect — or a card-advertised RPC URL — to another origin; configure that destination as its own peer instead. Peers without `tls` follow redirects, but the bearer token is dropped once a redirect leaves the peer's origin.
 
 ## Inbound: being callable
 
@@ -85,6 +94,7 @@ Secure by default; every widening step is explicit:
 - **Per-peer tokens** — `A2A_PEER_TOKENS="alice:tok1,bob:tok2"` gives each peer its own credential; the authenticated name drives rate limiting, trust, and audit.
 - **Prompt-injection filtering** — inbound text is filtered and framed as untrusted peer input. Remote peers cannot invoke operator slash commands.
 - **Outbound redaction** — credential-shaped strings (API keys, JWTs, tokens) are scrubbed from replies.
+- **Per-peer TLS / mTLS** — a peer's `tls` block pins a private CA and presents a client certificate; that identity, and any bearer token, never follows a redirect off the peer's origin.
 - **Audit log** — every exchange appends to `~/.hermes/a2a_audit.jsonl`.
 - **Anti-loop** — per-context turn caps stop two agents ping-ponging forever.
 
